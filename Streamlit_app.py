@@ -1,9 +1,20 @@
+# ChromaDB needs a newer SQLite than some Linux hosts (like Streamlit Cloud)
+# ship with. If pysqlite3-binary is installed, use it in place of the built-in
+# sqlite3. On Windows/local runs it's simply not installed and this does nothing.
+try:
+    __import__("pysqlite3")
+    import sys
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
+
 import os
 import time
 import hashlib
 import hmac
 import io
 import json
+import random
 import re
 import secrets
 from datetime import datetime
@@ -260,6 +271,40 @@ def count_user_chunks(vectorstore, user_id):
         return 0
     result = vectorstore._collection.get(where={"user_id": user_id}, include=[])
     return len(result["ids"])
+
+
+def list_user_documents(vectorstore, user_id):
+    """Return {filename: chunk_count} for every file this user has ingested,
+    read from the database itself, so it survives page refreshes."""
+    if vectorstore is None:
+        return {}
+    result = vectorstore._collection.get(where={"user_id": user_id}, include=["metadatas"])
+    files = {}
+    for metadata in result["metadatas"]:
+        name = os.path.basename(str((metadata or {}).get("source", "unknown")).replace("\\", "/"))
+        files[name] = files.get(name, 0) + 1
+    return dict(sorted(files.items()))
+
+
+def delete_user_document(vectorstore, user_id, filename):
+    """Delete ONE file's chunks (only this user's) from the database, and the
+    saved copy from disk. Matches on the file name, so it works regardless of
+    whether the stored path used / or \\ separators."""
+    result = vectorstore._collection.get(where={"user_id": user_id}, include=["metadatas"])
+    ids_to_delete = [
+        doc_id for doc_id, metadata in zip(result["ids"], result["metadatas"])
+        if os.path.basename(str((metadata or {}).get("source", "")).replace("\\", "/")) == filename
+    ]
+    if ids_to_delete:
+        vectorstore._collection.delete(ids=ids_to_delete)
+
+    saved_copy = os.path.join(DOCS_PATH, user_id, filename)
+    if os.path.exists(saved_copy):
+        try:
+            os.remove(saved_copy)
+        except OSError:
+            pass
+    return len(ids_to_delete)
 
 
 def ingest_uploaded_files(uploaded_files, user_id, progress_callback=None):
@@ -732,6 +777,69 @@ def build_chat_docx(messages, user_id):
     return buffer.getvalue()
 
 
+# ---------- Small talk (polite replies without searching documents) ----------
+# Short social messages like "hi" or "thank you" get an instant, friendly
+# reply instead of going through retrieval (which would search the documents
+# for the word "hi" and answer "I don't have enough information"). This is
+# rule-based, so it costs no API calls. It only triggers when the WHOLE
+# message is small talk, so "hi, what is the refund policy?" still goes to
+# the normal document Q&A.
+SMALLTALK_RULES = [
+    (
+        r"(h+i+|h+e+y+|h+e+l+o+|hola|namaste|yo|sup|good (morning|afternoon|evening)|greetings)"
+        r"( there| everyone| all| buddy| friend)?",
+        ["Hi! 👋 How can I help you with your documents today?",
+         "Hello! 😊 What would you like to know about your documents?",
+         "Hey there! Ask me anything about your uploaded documents."],
+    ),
+    (
+        r"((ok|okay|great|cool|nice) )?(thanks?|thank you|thank u|thx|thnx|ty|tysm|many thanks)"
+        r"( (so|very) much| a lot| a ton| again| bro| buddy)*",
+        ["You're welcome! 😊 Let me know if you need anything else.",
+         "Welcome! Happy to help. Ask me anything else anytime.",
+         "No problem at all! 👍"],
+    ),
+    (
+        r"(bye+|goodbye|good night|see you|see ya|cya|take care|talk to you later|ttyl)( later| soon)?",
+        ["Goodbye! 👋 Come back anytime.",
+         "Take care! Your documents will be here when you return.",
+         "Bye! Have a great day! 😊"],
+    ),
+    (
+        r"(how are you|how are u|how r u|how do you do|how is it going|hows it going|"
+        r"whats up|what is up|wassup)( today| doing)?",
+        ["I'm doing great, thank you for asking! 😊 How can I help you today?",
+         "All good here, thanks! What would you like to know about your documents?"],
+    ),
+    (
+        r"(who are you|what are you|what can you do|what do you do|help|help me)",
+        ["I'm a document assistant. Upload your files (PDF, Word, text or images) "
+         "and ask me questions. I'll answer using only what's in them and show you the sources."],
+    ),
+    (
+        r"(ok+|okay|k|cool|great|nice|awesome|got it|alright|fine|perfect|good|sure)",
+        ["👍 Anything else you'd like to know?",
+         "Great! Let me know if you have more questions."],
+    ),
+    (
+        r"(sorry|my bad|oops|excuse me)",
+        ["No problem at all! 😊 How can I help?"],
+    ),
+]
+
+
+def get_smalltalk_reply(query):
+    """Return a polite canned reply if the whole message is small talk, else None."""
+    cleaned = re.sub(r"[^a-z0-9\s]", "", query.lower().replace("'", ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned or len(cleaned) > 40:
+        return None
+    for pattern, replies in SMALLTALK_RULES:
+        if re.fullmatch(pattern, cleaned):
+            return random.choice(replies)
+    return None
+
+
 # ---------- Streamlit UI ----------
 
 st.set_page_config(page_title="RAG Chat", page_icon="📄")
@@ -745,6 +853,9 @@ if "messages" not in st.session_state:
 
 if "ingested_filenames" not in st.session_state:
     st.session_state.ingested_filenames = set()
+
+if "uploader_version" not in st.session_state:
+    st.session_state.uploader_version = 0
 
 # ---- Multi-user identity ----
 # There is only ONE shared database on disk — every visitor to this app's
@@ -824,7 +935,8 @@ st.subheader("Upload documents")
 uploaded_files = st.file_uploader(
     "Upload .txt, .docx, .pdf, or image files (.jpg/.png) — they'll be embedded automatically",
     type=["txt", "docx", "pdf", "jpg", "jpeg", "png", "webp", "bmp"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    key=f"uploader_{st.session_state.uploader_version}",
 )
 
 if uploaded_files:
@@ -888,10 +1000,17 @@ with st.sidebar:
     else:
         st.caption("⚠️ You haven't ingested any documents yet")
 
-    if st.session_state.ingested_filenames:
-        st.caption("Files you've ingested this session:")
-        for name in st.session_state.ingested_filenames:
-            st.caption(f"• {name}")
+    my_files = list_user_documents(st.session_state.vectorstore, user_id)
+    if my_files:
+        with st.expander(f"📂 My documents ({len(my_files)})", expanded=True):
+            for name, n_chunks in my_files.items():
+                name_col, button_col = st.columns([5, 1])
+                name_col.caption(f"• {name} — {n_chunks} chunks")
+                if button_col.button("🗑️", key=f"delete_{name}", help=f"Delete {name}"):
+                    delete_user_document(st.session_state.vectorstore, user_id, name)
+                    st.session_state.ingested_filenames.discard(name)
+                    st.session_state.uploader_version += 1  # reset uploader so the file isn't re-ingested
+                    st.rerun()
 
     st.divider()
     if st.button("🗑️ Clear MY documents", type="secondary", disabled=my_chunk_count == 0):
@@ -904,6 +1023,7 @@ with st.sidebar:
                 st.session_state.vectorstore._collection.delete(where={"user_id": user_id})
 
             st.session_state.ingested_filenames = set()
+            st.session_state.uploader_version += 1
             st.session_state.messages = []
             st.success("Your documents have been cleared. Upload files to start fresh.")
             st.rerun()
@@ -915,10 +1035,19 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 if query := st.chat_input("Ask a question about your documents..."):
+    smalltalk_reply = get_smalltalk_reply(query)
+    if smalltalk_reply:
+        # Polite small talk: answer instantly, no documents required.
+        st.session_state.messages.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
+        with st.chat_message("assistant"):
+            st.markdown(smalltalk_reply)
+        st.session_state.messages.append({"role": "assistant", "content": smalltalk_reply})
     # Gate on THIS user's own chunk count, not just whether the shared
     # vectorstore object exists — the shared DB may already have other
     # users' documents in it while this user still has none of their own.
-    if st.session_state.vectorstore is None or count_user_chunks(st.session_state.vectorstore, user_id) == 0:
+    elif st.session_state.vectorstore is None or count_user_chunks(st.session_state.vectorstore, user_id) == 0:
         st.warning("Please upload and ingest your own documents first.")
     else:
         st.session_state.messages.append({"role": "user", "content": query})
