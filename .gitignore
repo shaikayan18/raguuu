@@ -1,0 +1,13 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Local environment
+venv/
+__pycache__/
+*.pyc
+*.bak
+
+# User data (private documents, vector DB, accounts)
+db/
+docs/
