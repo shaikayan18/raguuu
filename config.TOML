@@ -1,0 +1,15 @@
+[theme]
+# Accent color used by buttons and highlights. Light/dark mode still follows
+# the viewer's choice (Settings menu or their system preference).
+primaryColor = "#0F766E"
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+# Per-file upload limit in MB. The app reads this value and shows it in the
+# uploader's help text, so what users see always matches the real limit.
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
