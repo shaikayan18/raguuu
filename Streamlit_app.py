@@ -113,7 +113,14 @@ def describe_page_with_gemini(image_bytes):
                 "- All regular text, exactly as written\n"
                 "- Any tables: reconstruct them as a markdown table with correct rows and columns\n"
                 "- Any figures, charts, or diagrams: describe what they show in plain text\n"
-                "No commentary, no summarizing — just the full factual content."
+                "- If the page is a grid of repeated records or cards (for example a list of people, "
+                "voters, products or forms), transcribe EVERY record, one per line, in reading order "
+                "(left to right, then top to bottom). Keep each record's serial number, ID codes, "
+                "names, relatives' names, addresses, ages and every other field exactly as printed. "
+                "Never skip, merge, shorten or summarize records, and never say how many there are.\n"
+                "- Ignore empty placeholder boxes such as 'Photo Available'; do not describe them.\n"
+                "- Copy the page header and footer (part number, page number, dates) once.\n"
+                "No commentary, no summarizing, just the full factual content."
             )
         },
         {
@@ -189,7 +196,12 @@ def load_pdf_with_vision(file_path, min_text_length=50, page_callback=None, max_
         if len(native_text) >= min_text_length and not has_images:
             contents[page_num] = native_text
         else:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            # 2x for normal pages, but cap the longest side at ~3000 px: huge scanned
+            # sheets (e.g. 1983x2806 pt) became ~4000x5600 px images, which get
+            # downscaled unpredictably and made small text unreadable.
+            longest = max(page.rect.width, page.rect.height) or 1
+            scale = max(1.0, min(2.0, 3000 / longest))
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
             vision_jobs[page_num] = pix.tobytes("png")
     pdf.close()
 
@@ -559,6 +571,52 @@ def retrieve_with_multi_query(vectorstore, query, user_id, k_per_query=6):
     return list(candidates.values()), unique_queries
 
 
+_LOOKUP_STOPWORDS = {
+    "the", "and", "for", "find", "check", "properly", "please", "what", "whats", "which", "who", "whom",
+    "name", "names", "number", "numbers", "page", "serial", "this", "that", "with", "from", "about", "give",
+    "tell", "show", "list", "any", "all", "are", "is", "was", "were", "has", "have", "does", "did", "can",
+    "you", "your", "his", "her", "their", "there", "document", "documents", "file", "files", "details",
+    "information", "info", "me", "my", "of", "in", "on", "at", "to", "a", "an", "by", "it", "its", "be",
+}
+
+
+def lexical_candidates(vectorstore, query, user_id, max_hits=12, max_chunks_scanned=4000):
+    """Exact-text safety net next to the semantic search.
+
+    Embedding search is weak at exact lookups (a person's name, a serial or ID
+    number) inside long lists. This scans the text of THIS user's chunks for
+    the distinctive words in the question and returns the best matches. Names
+    are also matched with spaces removed, so 'akhibk' finds 'akhib k'.
+    Returns [(Document, None)] so it merges with the normal candidates."""
+    from langchain_core.documents import Document
+
+    words = [w for w in re.findall(r"[a-z0-9]+", query.lower())
+             if w not in _LOOKUP_STOPWORDS and (len(w) >= 3 or w.isdigit())]
+    if not words:
+        return []
+    squashed_terms = set(words)
+    squashed_terms.update(a + b for a, b in zip(words, words[1:]))
+
+    result = vectorstore._collection.get(where={"user_id": user_id}, include=["documents", "metadatas"])
+    texts, metas = result.get("documents") or [], result.get("metadatas") or []
+    if len(texts) > max_chunks_scanned:
+        return []
+
+    scored = []
+    for text, meta in zip(texts, metas):
+        if not text:
+            continue
+        low = text.lower()
+        tokens = set(re.findall(r"[a-z0-9]+", low))
+        squashed = re.sub(r"[^a-z0-9]", "", low)
+        score = sum(1 for w in set(words) if w in tokens)
+        score += sum(2 for t in squashed_terms if len(t) >= 6 and t in squashed)
+        if score > 0:
+            scored.append((score, text, meta))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [(Document(page_content=text, metadata=dict(meta or {})), None) for _, text, meta in scored[:max_hits]]
+
+
 def rerank_with_bm25(query, candidates, top_n=8):
     """Rerank the candidate pool against the ORIGINAL user query using BM25
     keyword relevance (via rank_bm25 — a small, pure-Python library, no
@@ -721,6 +779,16 @@ def answer_question(vectorstore, query, user_id, chat_history=None, k_per_query=
     if on_stage:
         on_stage("Searching your documents...")
     candidates, queries_used = retrieve_with_multi_query(vectorstore, standalone_query, user_id, k_per_query=k_per_query)
+    try:
+        seen_keys = {d.metadata.get("chunk_id") or hashlib.md5(d.page_content.encode("utf-8")).hexdigest()
+                     for d, _ in candidates}
+        for doc, score in lexical_candidates(vectorstore, standalone_query, user_id):
+            key = doc.metadata.get("chunk_id") or hashlib.md5(doc.page_content.encode("utf-8")).hexdigest()
+            if key not in seen_keys:
+                seen_keys.add(key)
+                candidates.append((doc, score))
+    except Exception:
+        pass  # the keyword scan is a bonus; never let it break answering
     if on_stage:
         on_stage("Ranking the most relevant passages...")
     relevant_docs = rerank_with_bm25(standalone_query, candidates, top_n=min(final_k, len(candidates)))
