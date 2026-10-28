@@ -1713,7 +1713,10 @@ def render_sidebar(user_id, doc_files, total_chunks, uploader_here):
         # ---- chats ----
         st.markdown(section_html("Chats"), unsafe_allow_html=True)
         order = ss.conv_order
-        with st.container(key="chat_list", height=260 if len(order) > 6 else None, border=False):
+        list_opts = {"key": "chat_list", "border": False}
+        if len(order) > 6:
+            list_opts["height"] = 260  # scroll box only when the list is long
+        with st.container(**list_opts):
             for cid in order:
                 conv = ss.conversations[cid]
                 is_active = cid == ss.active_conv
@@ -1824,7 +1827,10 @@ def render_sources(msg):
         if understood:
             st.markdown(f'<div class="rc-evidence-note">Your question was understood as: '
                         f'<i>{esc(understood)}</i></div>', unsafe_allow_html=True)
-        with st.container(height=460 if len(sources) > 3 else None, border=False):
+        box_opts = {"border": False}
+        if len(sources) > 3:
+            box_opts["height"] = 460  # scroll box only when there are many passages
+        with st.container(**box_opts):
             for i, src in enumerate(sources, 1):
                 st.markdown(source_card_html(i, src), unsafe_allow_html=True)
 
