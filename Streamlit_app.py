@@ -816,26 +816,115 @@ Please provide a clear, helpful answer using only the information from these doc
 
 
 
-# ---------- Password authentication ----------
-# Accounts live in db/users.json as {user_id: {"salt": ..., "hash": ...}}.
-# Passwords are never stored in plain text: each one is salted and hashed
-# with PBKDF2-SHA256 (200k iterations), and checked with a constant-time
-# comparison.
+# ---------- Accounts and passwords ----------
+# Accounts are {user_id: {"salt": ..., "hash": ...}}. Passwords are never stored
+# in plain text: each one is salted and hashed with PBKDF2-SHA256 (200k
+# iterations) and checked with a constant-time comparison.
+#
+# WHERE accounts are stored matters. Streamlit Community Cloud wipes the app's
+# disk whenever the app restarts, redeploys or wakes from sleep, so a local file
+# loses every account. Two storage modes are supported:
+#   * Durable (recommended online): a private GitHub Gist, enabled by adding
+#     ACCOUNTS_GITHUB_TOKEN and ACCOUNTS_GIST_ID to the app's secrets.
+#   * Local file (db/users.json): fine on your own computer; temporary online.
 USERS_FILE = os.path.join("db", "users.json")
+USERS_GIST_FILE = "users.json"
+GITHUB_API = "https://api.github.com"
 MIN_PASSWORD_LENGTH = 6
 
 
+class AccountStorageError(Exception):
+    """Accounts can't be read or saved right now (network, permissions, bad data).
+    Always handled by telling the user to retry. It must never be treated as
+    'no accounts exist', or a failed read could let someone re-create a name or
+    overwrite every account."""
+
+
+class AccountExists(Exception):
+    pass
+
+
+def get_secret(name):
+    """Read a setting from the environment or Streamlit secrets (never from code)."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+def remote_accounts_config():
+    token, gist_id = get_secret("ACCOUNTS_GITHUB_TOKEN"), get_secret("ACCOUNTS_GIST_ID")
+    return (token, gist_id) if token and gist_id else None
+
+
+def accounts_are_durable():
+    return remote_accounts_config() is not None
+
+
+def running_on_streamlit_cloud():
+    try:
+        return os.path.abspath(__file__).startswith("/mount/")
+    except NameError:
+        return False
+
+
+def _gist_request(method, payload=None):
+    import requests
+
+    token, gist_id = remote_accounts_config()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        response = requests.request(method, f"{GITHUB_API}/gists/{gist_id}", headers=headers,
+                                    json=payload, timeout=15)
+    except requests.RequestException as exc:
+        raise AccountStorageError("Could not reach the account store") from exc
+    if response.status_code != 200:
+        raise AccountStorageError(f"Account store answered {response.status_code}")
+    return response.json()
+
+
 def load_users():
+    if remote_accounts_config():
+        data = _gist_request("GET")
+        entry = (data.get("files") or {}).get(USERS_GIST_FILE)
+        if entry is None or entry.get("truncated"):
+            raise AccountStorageError("Account file missing or too large")
+        try:
+            users = json.loads(entry.get("content") or "{}")
+        except ValueError as exc:
+            raise AccountStorageError("Account file is not valid JSON") from exc
+        if not isinstance(users, dict):
+            raise AccountStorageError("Account file has the wrong shape")
+        return users
+
     if not os.path.exists(USERS_FILE):
         return {}
     try:
         with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            users = json.load(f)
+        if not isinstance(users, dict):
+            raise ValueError("unexpected shape")
+        return users
     except Exception:
+        # keep the unreadable file for recovery instead of silently overwriting it
+        try:
+            os.replace(USERS_FILE, USERS_FILE + ".corrupt")
+        except OSError:
+            pass
         return {}
 
 
 def save_users(users):
+    if remote_accounts_config():
+        _gist_request("PATCH", {"files": {USERS_GIST_FILE: {"content": json.dumps(users)}}})
+        return
     os.makedirs(os.path.dirname(USERS_FILE), exist_ok=True)
     tmp_path = USERS_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -850,10 +939,23 @@ def hash_password(password, salt_hex):
 
 
 def create_account(user_id, password):
-    users = load_users()
+    """Create an account. Raises AccountExists if the name is taken and
+    AccountStorageError if it can't be saved. Reads fresh data right before
+    writing, and for remote storage reads back to confirm the account survived
+    a simultaneous sign-up by someone else."""
     salt_hex = secrets.token_hex(16)
-    users[user_id] = {"salt": salt_hex, "hash": hash_password(password, salt_hex)}
-    save_users(users)
+    record = {"salt": salt_hex, "hash": hash_password(password, salt_hex)}
+    for _ in range(3):
+        users = load_users()
+        if user_id in users:
+            raise AccountExists(user_id)
+        users[user_id] = record
+        save_users(users)
+        if not remote_accounts_config():
+            return
+        if load_users().get(user_id, {}).get("hash") == record["hash"]:
+            return
+    raise AccountStorageError("Could not confirm the new account was saved")
 
 
 def verify_password(user_id, password):
@@ -862,7 +964,6 @@ def verify_password(user_id, password):
         return False
     candidate = hash_password(password, record["salt"])
     return hmac.compare_digest(candidate, record["hash"])
-
 
 
 def _add_markdown_text(paragraph, text):
@@ -985,17 +1086,14 @@ def get_smalltalk_reply(query):
 
 # ---------- Streamlit UI ----------
 # Everything above this line is the RAG engine (loading, chunking, embedding,
-# retrieval, answering). Everything below is the interface. The UI only calls
-# the engine's functions; it never changes how documents are processed.
+# retrieval, answering) plus accounts. Everything below is the interface. The UI
+# only calls the engine's functions; it never changes how documents are processed.
 #
 # Design notes:
-#  * Layout and controls use Streamlit's own widgets, so they keep working
-#    when Streamlit changes its internals.
-#  * Custom CSS is cosmetic polish only. It is scoped with `st.container(key=...)`
-#    (a documented styling hook) plus a few stable data-testid attributes. If a
-#    selector ever stops matching, the app loses some polish but keeps working.
-#  * All colors adapt to light and dark themes (translucent surfaces, no
-#    hard-coded backgrounds).
+#  * Native Streamlit widgets do the layout, so it keeps working as Streamlit changes.
+#  * A small amount of CSS adds polish only. If a selector ever stops matching, the
+#    app loses a little polish but keeps working.
+#  * Colors are neutral and follow the viewer's light/dark theme, with one teal accent.
 
 import streamlit.components.v1 as components
 
@@ -1012,203 +1110,143 @@ AVATARS = {"user": ":material/person:", "assistant": ":material/auto_awesome:"}
 SOURCE_EXCERPT_CHARS = 700
 CONTEXT_CHUNK_CHOICES = ["Auto", 6, 8, 10, 12, 15, 18]
 
-st.set_page_config(
-    page_title=APP_NAME,
-    page_icon=":material/description:",
-    layout="centered",
-    initial_sidebar_state="auto",
-)
+st.set_page_config(page_title=APP_NAME, page_icon=":material/description:", layout="centered",
+                   initial_sidebar_state="auto")
 
 logger = logging.getLogger("rag_chat")
 
 
 # =====================================================================
-# Design system: CSS
+# Styling
 # =====================================================================
 APP_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+:root { --rc-accent:#0F766E; --rc-accent-dark:#0B5F58; --rc-accent-soft:rgba(15,118,110,.11);
+        --rc-line:rgba(127,127,127,.25); --rc-soft:rgba(127,127,127,.08); }
 
-:root { --rc-accent:#0F766E; --rc-accent-soft:rgba(15,118,110,.10);
-        --rc-border:rgba(127,127,127,.26); --rc-surface:rgba(127,127,127,.07);
-        --rc-radius:14px; --rc-radius-sm:10px; }
+/* room under Streamlit's top bar; hide the Deploy button */
+[data-testid="stMainBlockContainer"] { padding-top:4.2rem; padding-bottom:6rem; }
+.stAppDeployButton, [data-testid="stAppDeployButton"] { display:none; }
 
-.stApp { font-family:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
-         -webkit-font-smoothing:antialiased; }
-[data-testid="stMainBlockContainer"], .block-container { max-width:880px; padding-top:2rem; padding-bottom:7rem; }
-[data-testid="stSidebar"] { border-right:1px solid var(--rc-border); }
+/* one accent color, even if the theme file isn't installed */
+[data-testid^="stBaseButton-primary"] { background:var(--rc-accent); border-color:var(--rc-accent); color:#fff; }
+[data-testid^="stBaseButton-primary"]:hover:not(:disabled) { background:var(--rc-accent-dark); border-color:var(--rc-accent-dark); color:#fff; }
+[data-testid^="stBaseButton-primary"]:focus-visible { box-shadow:0 0 0 3px var(--rc-accent-soft); }
 
-/* ---------- brand ---------- */
-.rc-brand { display:flex; align-items:center; gap:.7rem; margin:.1rem 0 1rem; }
-.rc-brand svg { width:34px; height:34px; flex:0 0 auto; }
-.rc-brand-name { font-weight:650; font-size:1.02rem; letter-spacing:-.01em; line-height:1.2; }
-.rc-brand-sub { font-size:.72rem; opacity:.6; }
-.rc-section { font-size:.7rem; letter-spacing:.07em; text-transform:uppercase; font-weight:600;
-              opacity:.55; margin:1.15rem 0 .4rem; }
-.rc-summary { font-size:.8rem; opacity:.75; margin:0 0 .55rem; }
-.rc-note { font-size:.74rem; opacity:.6; line-height:1.45; margin:.35rem 0; }
+/* sidebar: tighter rhythm */
+.rc-brand { display:flex; align-items:center; gap:.6rem; font-weight:600; font-size:1.02rem; padding:.2rem 0 .3rem; }
+.rc-brand svg { width:30px; height:30px; flex:0 0 auto; }
+.rc-label { font-size:.82rem; font-weight:600; opacity:.6; padding-top:.6rem; }
+.rc-hint { font-size:.78rem; opacity:.6; line-height:1.4; padding-bottom:.2rem; }
 
-/* ---------- landing ---------- */
-.rc-hero { text-align:center; padding:2.2rem 0 1.4rem; }
-.rc-hero-logo svg { width:54px; height:54px; }
-.rc-hero-title { font-size:2.15rem; font-weight:650; letter-spacing:-.03em; margin:.85rem 0 .45rem; line-height:1.15; }
-.rc-hero-sub { max-width:34rem; margin:0 auto; opacity:.72; font-size:1.02rem; line-height:1.55; }
-.rc-chips { display:flex; flex-wrap:wrap; gap:.4rem; justify-content:center; margin:1rem 0 .2rem; }
-.rc-doc-chip { display:inline-flex; align-items:center; gap:.4rem; padding:.22rem .65rem; border-radius:999px;
-               border:1px solid var(--rc-border); background:var(--rc-surface); font-size:.78rem; max-width:100%; }
-.rc-doc-chip svg { width:13px; height:13px; flex:0 0 auto; opacity:.7; }
-.rc-doc-chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:16rem; }
-.rc-label { font-size:.78rem; font-weight:600; opacity:.65; margin:1.1rem 0 .5rem; text-align:center; }
-
-/* suggestion cards */
-.st-key-suggestions button { min-height:3.5rem; height:auto; text-align:left; justify-content:flex-start;
-                             padding:.8rem 1rem; border-radius:12px; transition:border-color .15s, background .15s; }
-.st-key-suggestions button:hover:not(:disabled) { border-color:var(--rc-accent); background:var(--rc-accent-soft); }
-
-/* ---------- chat ---------- */
-.rc-chat-title { font-weight:600; font-size:1.02rem; letter-spacing:-.01em; overflow:hidden;
-                 text-overflow:ellipsis; white-space:nowrap; }
-.rc-chat-sub { font-size:.74rem; opacity:.55; margin-top:.1rem; }
-.rc-role { font-size:.76rem; font-weight:600; opacity:.65; margin-bottom:.2rem; }
-.rc-meta { font-size:.72rem; opacity:.5; margin-top:.4rem; }
-
-[data-testid="stChatMessage"] { border-radius:var(--rc-radius); padding:.9rem 1rem; margin-bottom:.4rem;
-                                animation:rc-in .28s ease-out both; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { background:var(--rc-surface);
-                                                                            border:1px solid var(--rc-border); }
-
-/* typing + skeleton */
-.rc-typing { display:flex; align-items:center; gap:.65rem; font-size:.9rem; opacity:.85; padding:.15rem 0 .5rem; }
-.rc-dots span { display:inline-block; width:6px; height:6px; margin-right:3px; border-radius:50%;
-                background:var(--rc-accent); animation:rc-bounce 1.2s infinite ease-in-out; }
-.rc-dots span:nth-child(2) { animation-delay:.15s; } .rc-dots span:nth-child(3) { animation-delay:.3s; }
-.rc-skel div { height:11px; border-radius:6px; margin:.55rem 0; background:linear-gradient(90deg,
-               rgba(127,127,127,.14) 25%, rgba(127,127,127,.26) 37%, rgba(127,127,127,.14) 63%);
-               background-size:400% 100%; animation:rc-shimmer 1.4s ease infinite; }
-.rc-skel div:nth-child(1) { width:94%; } .rc-skel div:nth-child(2) { width:78%; } .rc-skel div:nth-child(3) { width:52%; }
-
-/* error card */
-.rc-error { display:flex; gap:.7rem; padding:.8rem .95rem; border-radius:var(--rc-radius-sm);
-            border:1px solid rgba(180,35,24,.38); background:rgba(180,35,24,.07); }
-.rc-error svg { width:18px; height:18px; flex:0 0 auto; margin-top:.1rem; color:#B42318;
-                color:color-mix(in srgb,#B42318 75%,currentColor); }
-.rc-error-title { font-weight:600; font-size:.92rem; }
-.rc-error-hint { font-size:.84rem; opacity:.8; margin-top:.15rem; line-height:1.45; }
-
-/* ---------- sources ---------- */
-.rc-evidence-note { font-size:.78rem; opacity:.7; line-height:1.5; margin:.1rem 0 .6rem; }
-.rc-src { border:1px solid var(--rc-border); border-radius:var(--rc-radius-sm); padding:.75rem .9rem;
-          margin:.55rem 0; background:var(--rc-surface); transition:border-color .15s; }
-.rc-src:hover { border-color:var(--rc-accent); }
-.rc-src-head { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
-.rc-src-num { width:21px; height:21px; border-radius:6px; display:grid; place-items:center; font-size:.7rem;
-              font-weight:700; background:var(--rc-accent-soft); color:#0F766E;
-              color:color-mix(in srgb,#0F766E 70%,currentColor); flex:0 0 auto; }
-.rc-src-name { font-weight:600; font-size:.86rem; word-break:break-word; }
-.rc-chip { font-size:.7rem; padding:.05rem .45rem; border:1px solid var(--rc-border); border-radius:6px; opacity:.85; }
-.rc-quote { margin:.6rem 0 0; padding:.1rem 0 .1rem .8rem; border-left:3px solid var(--rc-accent); font-size:.84rem;
-            line-height:1.6; opacity:.9; white-space:pre-wrap; word-break:break-word; }
-.rc-src-foot { font-size:.7rem; opacity:.5; margin-top:.45rem; word-break:break-all; }
-
-/* ---------- document cards ---------- */
-.rc-file { display:flex; gap:.7rem; align-items:flex-start; padding:.65rem .75rem; border-radius:var(--rc-radius-sm);
-           border:1px solid var(--rc-border); background:var(--rc-surface); transition:border-color .15s; }
-.rc-file:hover { border-color:var(--rc-accent); }
-.rc-file-icon { flex:0 0 34px; height:34px; border-radius:9px; display:grid; place-items:center;
-                background:var(--rc-accent-soft); color:#0F766E; color:color-mix(in srgb,#0F766E 70%,currentColor); }
-.rc-file-icon svg { width:18px; height:18px; }
-.rc-file-body { min-width:0; flex:1; }
-.rc-file-name { font-weight:560; font-size:.86rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.rc-file-meta { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; margin-top:.25rem; font-size:.72rem; opacity:.9; }
-.rc-file-detail { font-size:.74rem; opacity:.75; margin-top:.35rem; line-height:1.4; }
-.rc-pill { display:inline-flex; align-items:center; gap:.3rem; padding:.07rem .5rem; border-radius:999px;
-           font-size:.7rem; font-weight:600; }
-.rc-pill svg { width:12px; height:12px; }
-.rc-pill-ready { background:rgba(15,118,110,.14); color:#0F766E; color:color-mix(in srgb,#0F766E 70%,currentColor); }
-.rc-pill-busy  { background:rgba(180,83,9,.14);  color:#B45309; color:color-mix(in srgb,#B45309 70%,currentColor); }
-.rc-pill-fail  { background:rgba(180,35,24,.13); color:#B42318; color:color-mix(in srgb,#B42318 70%,currentColor); }
-.rc-pill-new   { background:rgba(127,127,127,.16); }
-.rc-spin { animation:rc-spin 1s linear infinite; }
-
-/* sidebar conversation list */
-.st-key-chat_list button { justify-content:flex-start; text-align:left; }
+/* chat list */
+.st-key-chat_list button { justify-content:flex-start; text-align:left; font-weight:400; }
 .st-key-chat_list button p { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .st-key-conv_active button { background:var(--rc-accent-soft); }
 
-/* general control polish */
-.stButton > button, [data-testid="stPopover"] > button, [data-testid="stDownloadButton"] button
-    { border-radius:10px; transition:border-color .15s, background .15s; }
-.stButton > button:hover:not(:disabled) { border-color:var(--rc-accent); }
+/* document rows */
+.rc-doc { display:flex; align-items:center; gap:.5rem; font-size:.88rem; min-width:0; }
+.rc-doc svg { width:15px; height:15px; flex:0 0 auto; opacity:.6; }
+.rc-doc span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rc-doc-busy { opacity:.75; }
+.rc-doc-err { font-size:.78rem; color:#B42318; color:color-mix(in srgb,#B42318 80%,currentColor); margin:.1rem 0 0 1.45rem; line-height:1.35; }
+.rc-spin { animation:rc-spin 1s linear infinite; }
+
+/* keep small rows on one line, even on phones */
+.st-key-doc_rows [data-testid="stHorizontalBlock"], .st-key-account_row [data-testid="stHorizontalBlock"],
+.st-key-chat_header [data-testid="stHorizontalBlock"], .st-key-msg_actions [data-testid="stHorizontalBlock"]
+    { flex-wrap:nowrap; align-items:center; }
+.st-key-doc_rows [data-testid="stColumn"], .st-key-account_row [data-testid="stColumn"],
+.st-key-chat_header [data-testid="stColumn"], .st-key-msg_actions [data-testid="stColumn"] { min-width:0; }
+
+@media (max-width: 640px) {
+  .st-key-chat_header [data-testid="stHorizontalBlock"] { flex-wrap:wrap; row-gap:.2rem; }
+  .st-key-chat_header [data-testid="stColumn"]:nth-child(1) { flex:1 1 100% !important; width:100% !important; }
+  .st-key-chat_header [data-testid="stColumn"]:nth-child(2) { flex:1 1 auto !important; width:auto !important; }
+  .st-key-chat_header [data-testid="stColumn"]:nth-child(3) { flex:0 0 auto !important; width:auto !important; min-width:3rem; }
+  .st-key-msg_actions [data-testid="stColumn"]:nth-child(1) { flex:0 0 6.5rem !important; width:6.5rem !important; }
+  .st-key-msg_actions [data-testid="stColumn"]:nth-child(2) { flex:0 0 auto !important; width:auto !important; }
+  .st-key-msg_actions [data-testid="stColumn"]:nth-child(3) { display:none; }
+}
+
+[data-testid^="stBaseButton-tertiary"] { color:inherit; }
+
+/* landing */
+.rc-hero { text-align:center; padding:1.5rem 0 1.2rem; }
+.rc-hero svg { width:44px; height:44px; }
+.rc-hero h1 { font-size:2rem; font-weight:650; letter-spacing:-.02em; margin:.8rem 0 .4rem; padding:0; line-height:1.2; }
+.rc-hero p { opacity:.7; margin:0 auto; max-width:30rem; line-height:1.5; }
+.st-key-suggestions button { justify-content:flex-start; text-align:left; padding:.7rem .95rem; height:auto; min-height:3rem; }
+.st-key-suggestions button:hover:not(:disabled) { border-color:var(--rc-accent); background:var(--rc-accent-soft); }
+
+/* chat */
+.rc-title { font-weight:600; font-size:1.02rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:0; padding:.2rem 0; }
+.st-key-chat_header [data-testid="stMarkdownContainer"] { margin:0; }
+[data-testid="stChatMessage"] { scroll-margin-top:5rem; animation:rc-in .25s ease-out both; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { background:var(--rc-soft); }
+.rc-typing { display:flex; align-items:center; gap:.6rem; opacity:.8; padding:.2rem 0; }
+.rc-dots span { display:inline-block; width:6px; height:6px; margin-right:3px; border-radius:50%;
+                background:var(--rc-accent); animation:rc-bounce 1.2s infinite ease-in-out; }
+.rc-dots span:nth-child(2) { animation-delay:.15s; } .rc-dots span:nth-child(3) { animation-delay:.3s; }
+.rc-error { display:flex; gap:.65rem; padding:.75rem .9rem; border-radius:10px; border:1px solid rgba(180,35,24,.35);
+            background:rgba(180,35,24,.07); }
+.rc-error svg { width:18px; height:18px; flex:0 0 auto; margin-top:.1rem; color:#B42318; }
+.rc-error b { display:block; }
+.rc-error span { font-size:.88rem; opacity:.85; }
+
+/* sources */
+[data-testid="stExpander"] details { border-color:var(--rc-line); border-radius:10px; }
+.rc-src { margin:.2rem 0 1rem; }
+.rc-src-head { display:flex; flex-wrap:wrap; align-items:baseline; gap:.2rem .7rem; font-size:.9rem; }
+.rc-src-head small { opacity:.6; }
+.rc-quote { margin:.35rem 0 0; padding-left:.8rem; border-left:3px solid var(--rc-accent); font-size:.88rem; line-height:1.55;
+            opacity:.9; white-space:pre-wrap; word-break:break-word; }
 
 /* login */
-.rc-login-title { text-align:center; font-size:1.55rem; font-weight:650; letter-spacing:-.025em; margin:.7rem 0 .25rem; }
-.rc-login-sub { text-align:center; opacity:.7; font-size:.94rem; margin-bottom:1.1rem; line-height:1.5; }
-.rc-login-logo { display:flex; justify-content:center; margin-top:2.2rem; }
-.rc-login-logo svg { width:50px; height:50px; }
+.rc-login { text-align:center; padding:1rem 0 .6rem; }
+.rc-login svg { width:44px; height:44px; }
+.rc-login h1 { font-size:1.6rem; font-weight:650; letter-spacing:-.02em; margin:.7rem 0 .3rem; padding:0; }
+.rc-login p { opacity:.7; margin:0; }
 
-@keyframes rc-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+@keyframes rc-in { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
 @keyframes rc-bounce { 0%,80%,100% { transform:scale(.6); opacity:.5; } 40% { transform:scale(1); opacity:1; } }
-@keyframes rc-shimmer { 0% { background-position:100% 50%; } 100% { background-position:0 50%; } }
 @keyframes rc-spin { to { transform:rotate(360deg); } }
-
 @media (max-width:640px) {
-  [data-testid="stMainBlockContainer"], .block-container { padding-left:1rem; padding-right:1rem; padding-top:1.2rem; }
-  .rc-hero { padding-top:1.2rem; } .rc-hero-title { font-size:1.65rem; } .rc-hero-sub { font-size:.95rem; }
-  .rc-doc-chip span { max-width:11rem; }
+  [data-testid="stMainBlockContainer"] { padding-top:3.6rem; }
+  .rc-hero h1 { font-size:1.6rem; }
 }
-@media (prefers-reduced-motion:reduce) {
-  *, *::before, *::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; }
-}
+@media (prefers-reduced-motion:reduce) { *, *::before, *::after { animation:none !important; transition:none !important; } }
 </style>
 """
 
 
 # =====================================================================
-# Small HTML components (all user-provided text is escaped)
+# Small HTML pieces (all user-provided text is escaped)
 # =====================================================================
 def esc(value):
     return html_lib.escape(str(value), quote=True)
 
 
-ICON_PATHS = {
-    "file": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'
-            '<line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>',
-    "image": '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/>'
-             '<polyline points="21 15 16 10 5 21"/>',
-    "check": '<polyline points="20 6 9 17 4 12"/>',
+ICONS = {
+    "file": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
+    "image": '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
     "alert": '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
     "loader": '<path d="M21 12a9 9 0 1 1-6.219-8.56"/>',
-    "upload": '<polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>'
-              '<path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>',
 }
 
 
-def icon_svg(name, size=16, css_class=""):
-    return (
-        f'<svg class="{css_class}" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
-        f'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
-        f'aria-hidden="true">{ICON_PATHS[name]}</svg>'
-    )
+def icon_svg(name, css_class=""):
+    return (f'<svg class="{css_class}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+            f'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{ICONS[name]}</svg>')
 
 
-def logo_svg(size=34):
+def logo_svg():
     return (
-        f'<svg width="{size}" height="{size}" viewBox="0 0 32 32" role="img" aria-label="{APP_NAME}">'
-        '<rect width="32" height="32" rx="9" fill="#0F766E"/>'
+        f'<svg viewBox="0 0 32 32" role="img" aria-label="{APP_NAME}"><rect width="32" height="32" rx="9" fill="#0F766E"/>'
         '<path d="M10.5 9h7l4 4v9.5a1.5 1.5 0 0 1-1.5 1.5h-9.5A1.5 1.5 0 0 1 9 22.5v-12A1.5 1.5 0 0 1 10.5 9z" '
         'fill="none" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>'
-        '<path d="M12.5 17.5h7M12.5 20.5h4.5" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/>'
-        '</svg>'
+        '<path d="M12.5 17.5h7M12.5 20.5h4.5" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>'
     )
-
-
-def brand_html():
-    return (f'<div class="rc-brand">{logo_svg(34)}<div><div class="rc-brand-name">{APP_NAME}</div>'
-            '<div class="rc-brand-sub">Answers from your own documents</div></div></div>')
-
-
-def section_html(title):
-    return f'<div class="rc-section">{esc(title)}</div>'
 
 
 def human_size(num_bytes):
@@ -1225,69 +1263,38 @@ def file_ext(name):
     return os.path.splitext(name)[1].lower().lstrip(".")
 
 
-def file_card_html(name, status, chunks=None, size=None, detail=None):
-    """status: 'ready' (indexed, searchable), 'busy' (being indexed), 'fail'."""
-    ext = file_ext(name)
-    icon = icon_svg("image" if ext in IMAGE_TYPES else "file", 18)
-    pill = {
-        "ready": ("rc-pill-ready", icon_svg("check", 12), "Ready"),
-        "busy": ("rc-pill-busy", icon_svg("loader", 12, "rc-spin"), "Indexing"),
-        "fail": ("rc-pill-fail", icon_svg("alert", 12), "Failed"),
-    }[status]
-    meta = []
-    if ext:
-        meta.append(f'<span class="rc-chip">{esc(ext.upper())}</span>')
-    if size:
-        meta.append(f"<span>{esc(human_size(size))}</span>")
-    if chunks:
-        meta.append(f"<span>{chunks} chunk{'s' if chunks != 1 else ''}</span>")
-    meta.append(f'<span class="rc-pill {pill[0]}">{pill[1]}{pill[2]}</span>')
-    detail_html = f'<div class="rc-file-detail">{esc(detail)}</div>' if detail else ""
-    return (
-        f'<div class="rc-file"><div class="rc-file-icon">{icon}</div><div class="rc-file-body">'
-        f'<div class="rc-file-name" title="{esc(name)}">{esc(name)}</div>'
-        f'<div class="rc-file-meta">{"".join(meta)}</div>{detail_html}</div></div>'
-    )
+def doc_row_html(name, tooltip="", busy=False):
+    icon = icon_svg("loader", "rc-spin") if busy else icon_svg("image" if file_ext(name) in IMAGE_TYPES else "file")
+    label = f"{name} (indexing)" if busy else name
+    return f'<div class="rc-doc{" rc-doc-busy" if busy else ""}" title="{esc(tooltip or name)}">{icon}<span>{esc(label)}</span></div>'
 
 
 def typing_html(stage):
-    return (
-        f'<div class="rc-typing" role="status" aria-live="polite"><span class="rc-dots"><span></span><span></span>'
-        f'<span></span></span><span>{esc(stage)}</span></div>'
-        '<div class="rc-skel" aria-hidden="true"><div></div><div></div><div></div></div>'
-    )
+    return (f'<div class="rc-typing" role="status" aria-live="polite"><span class="rc-dots"><span></span><span></span>'
+            f'<span></span></span><span>{esc(stage)}</span></div>')
 
 
 def error_card_html(title, hint):
-    return (
-        f'<div class="rc-error" role="alert">{icon_svg("alert", 18)}<div><div class="rc-error-title">{esc(title)}</div>'
-        f'<div class="rc-error-hint">{esc(hint)}</div></div></div>'
-    )
+    return f'<div class="rc-error" role="alert">{icon_svg("alert")}<div><b>{esc(title)}</b><span>{esc(hint)}</span></div></div>'
 
 
-def source_card_html(index, src):
-    chips = []
-    page = src.get("page")
-    if page is not None and str(page) != "":
-        chips.append(f'<span class="rc-chip">Page {esc(page)}</span>')
-    if src.get("section"):
-        chips.append(f'<span class="rc-chip">Section: {esc(src["section"])}</span>')
-    excerpt = src.get("excerpt", "")
-    ellipsis = "…" if src.get("truncated") else ""
-    foot = f'<div class="rc-src-foot">Chunk ID: {esc(src["chunk_id"])}</div>' if src.get("chunk_id") else ""
-    return (
-        f'<div class="rc-src"><div class="rc-src-head"><span class="rc-src-num">{index}</span>'
-        f'<span class="rc-src-name">{esc(src.get("name", "unknown"))}</span>{"".join(chips)}</div>'
-        f'<div class="rc-quote">{esc(excerpt)}{ellipsis}</div>{foot}</div>'
-    )
+def source_html(index, src):
+    meta = []
+    if src.get("page") is not None and str(src["page"]) != "":
+        meta.append(f'<small>page {esc(src["page"])}</small>')
+    if src.get("section") and src["section"] != "General":
+        meta.append(f'<small>{esc(src["section"])}</small>')
+    excerpt = src.get("excerpt", "") + ("…" if src.get("truncated") else "")
+    tip = f' title="Chunk {esc(src["chunk_id"])}"' if src.get("chunk_id") else ""
+    return (f'<div class="rc-src"{tip}><div class="rc-src-head"><b>{index}. {esc(src.get("name", "unknown"))}</b>'
+            f'{"".join(meta)}</div><div class="rc-quote">{esc(excerpt)}</div></div>')
 
 
 # =====================================================================
 # Friendly error messages (never expose raw exceptions or secrets)
 # =====================================================================
 def friendly_error(exc):
-    """Map an exception to (title, hint) for display. The real exception is
-    logged on the server only."""
+    """Map an exception to (title, hint). The real exception is logged on the server only."""
     logger.exception("Answer generation failed")
     text = f"{type(exc).__name__} {exc}".lower()
 
@@ -1301,8 +1308,7 @@ def friendly_error(exc):
         return ("The AI service rejected the request.",
                 "The API key may be missing or invalid. The app owner should check the key configured for this app.")
     if has_code("404") or "not_found" in text or ("not found" in text and "model" in text):
-        return ("The configured AI model isn't available.",
-                "The app owner should check the model name in the app's settings.")
+        return ("The configured AI model isn't available.", "The app owner should check the model name in the app's settings.")
     if "timeout" in text or "timed out" in text or "deadline" in text or has_code("503", "504") \
             or "unavailable" in text or "overloaded" in text:
         return ("The AI service didn't respond in time.", "Try again in a moment.")
@@ -1313,7 +1319,7 @@ def friendly_error(exc):
 
 
 def friendly_file_error(message):
-    """Turn a raw ingestion error into a short, safe message for a file card."""
+    """Turn a raw ingestion error into a short, safe message for a file row."""
     text = str(message)
     low = text.lower()
     if low.startswith("unsupported file type") or low.startswith("no extractable text") \
@@ -1347,13 +1353,9 @@ def active_conv():
     return st.session_state.conversations[st.session_state.active_conv]
 
 
-def now_label():
-    return datetime.now().strftime("%H:%M")
-
-
 def doc_to_source(doc):
-    """Only real metadata from the retrieval pipeline. Nothing is invented:
-    there are no relevance scores because the pipeline doesn't return them."""
+    """Only real metadata from the retrieval pipeline. Nothing is invented (no scores:
+    the pipeline doesn't return any)."""
     meta = doc.metadata or {}
     text = doc.page_content or ""
     return {
@@ -1370,21 +1372,20 @@ def flash(kind, message):
     st.session_state.flash.append((kind, message))
 
 
-# ---- the single entry point for "user asked something" ----
 def dispatch_question(conv, text):
-    """The user's message is already in conv. Reply to small talk instantly,
-    explain if there are no documents yet, otherwise queue it for the RAG
-    pipeline (which runs on the next rerun so the input can be disabled)."""
+    """The user's message is already in conv. Reply to small talk instantly, explain if there
+    are no documents yet, otherwise queue it for the RAG pipeline (it runs on the next rerun
+    so the input can be disabled meanwhile)."""
     ss = st.session_state
     reply = get_smalltalk_reply(text)
     if reply:
-        conv["messages"].append({"role": "assistant", "content": reply, "time": now_label(), "kind": "smalltalk"})
+        conv["messages"].append({"role": "assistant", "content": reply, "kind": "smalltalk"})
         ss.scroll_pending = True
         return
     user_id = ss.authenticated_user
     if ss.vectorstore is None or count_user_chunks(ss.vectorstore, user_id) == 0:
         conv["messages"].append({
-            "role": "assistant", "kind": "notice", "time": now_label(),
+            "role": "assistant", "kind": "notice",
             "content": "You haven't added any documents yet. Upload a PDF, Word file, text file or image "
                        "and I can answer questions from it.",
         })
@@ -1400,7 +1401,7 @@ def queue_question(text):
     if ss.generating or not text.strip():
         return
     conv = active_conv()
-    conv["messages"].append({"role": "user", "content": text.strip(), "time": now_label()})
+    conv["messages"].append({"role": "user", "content": text.strip()})
     if len([m for m in conv["messages"] if m["role"] == "user"]) == 1:
         conv["title"] = make_title(text)
     dispatch_question(conv, text.strip())
@@ -1409,10 +1410,8 @@ def queue_question(text):
 # ---- callbacks (run before the script reruns) ----
 def cb_new_chat():
     ss = st.session_state
-    if ss.generating:
+    if ss.generating or not active_conv()["messages"]:
         return
-    if not active_conv()["messages"]:
-        return  # already on an empty chat
     new_conversation()
 
 
@@ -1457,9 +1456,8 @@ def do_delete_chat(cid):
 
 def do_delete_document(name):
     ss = st.session_state
-    user_id = ss.authenticated_user
     try:
-        delete_user_document(ss.vectorstore, user_id, name)
+        delete_user_document(ss.vectorstore, ss.authenticated_user, name)
         ss.file_errors.pop(name, None)
         ss.file_sizes.pop(name, None)
         ss.ingested_filenames.discard(name)
@@ -1474,8 +1472,7 @@ def do_clear_documents():
     ss = st.session_state
     user_id = ss.authenticated_user
     try:
-        # Deletes ONLY this user's chunks (filtered by user_id), never the
-        # whole shared collection.
+        # Deletes ONLY this user's chunks (filtered by user_id), never the whole shared collection.
         if ss.vectorstore is not None:
             ss.vectorstore._collection.delete(where={"user_id": user_id})
         user_dir = os.path.join(DOCS_PATH, user_id)
@@ -1485,9 +1482,7 @@ def do_clear_documents():
                     os.remove(os.path.join(user_dir, leftover))
                 except OSError:
                     pass
-        ss.file_errors = {}
-        ss.file_sizes = {}
-        ss.ingested_filenames = set()
+        ss.file_errors, ss.file_sizes, ss.ingested_filenames = {}, {}, set()
         ss.uploader_version += 1
         flash("success", "All your documents were removed.")
     except Exception:
@@ -1508,13 +1503,10 @@ def cb_dismiss_error(name):
 
 def cb_logout():
     ss = st.session_state
-    for key in ("authenticated_user", "chat_owner", "conversations", "conv_order", "active_conv", "pending",
-                "docx_cache"):
+    for key in ("authenticated_user", "chat_owner", "conversations", "conv_order", "active_conv", "pending", "docx_cache"):
         ss.pop(key, None)
     ss.generating = False
-    ss.file_errors = {}
-    ss.file_sizes = {}
-    ss.ingested_filenames = set()
+    ss.file_errors, ss.file_sizes, ss.ingested_filenames = {}, {}, set()
     ss.uploader_version += 1
 
 
@@ -1536,53 +1528,73 @@ def normalize_user_id(raw):
     return raw.strip().lower().replace(" ", "_")
 
 
+def storage_notice():
+    """Tell people honestly when accounts live on temporary storage."""
+    if accounts_are_durable() or not running_on_streamlit_cloud():
+        return
+    st.warning("Accounts are kept on this server's temporary storage and can be reset when the app restarts. "
+               "The app owner can make them permanent in the app's settings.", icon=":material/warning:")
+
+
 def render_login():
     try:
         url_user = st.query_params.get("user", "")
     except Exception:
         url_user = ""
 
-    _, middle, _ = st.columns([1, 2.2, 1])
+    _, middle, _ = st.columns([1, 4, 1])
     with middle:
-        st.markdown(
-            f'<div class="rc-login-logo">{logo_svg(50)}</div>'
-            f'<div class="rc-login-title">Welcome to {APP_NAME}</div>'
-            '<div class="rc-login-sub">Upload your documents and ask questions about them. '
-            'Sign in with a name and password to keep your documents private.</div>',
-            unsafe_allow_html=True,
-        )
-        with st.container(border=True):
-            raw = st.text_input(
-                "Name or ID", value=url_user, key="login_name", placeholder="e.g. akhib, or your email",
-                help="Use the same name each time to see your own documents again.",
-            )
-            uid = normalize_user_id(raw)
-            if not uid:
-                st.caption("Enter your name or ID, then press Enter.")
-                return
+        st.markdown(f'<div class="rc-login">{logo_svg()}<h1>Welcome to {APP_NAME}</h1>'
+                    '<p>Sign in to chat with your own documents.</p></div>', unsafe_allow_html=True)
+        storage_notice()
+        raw = st.text_input("Name or ID", value=url_user, key="login_name", placeholder="e.g. akhib, or your email")
+        uid = normalize_user_id(raw)
+        if not uid:
+            st.caption("Type your name or ID and press Enter. Use the same one each time to see your own documents.")
+            return
 
+        try:
             users = load_users()
-            if uid not in users:
-                st.caption(f"No account exists for **{uid}** yet. Choose a password to create one.")
-                with st.form("signup_form"):
-                    new_password = st.text_input("Choose a password", type="password")
-                    confirm_password = st.text_input("Confirm password", type="password")
-                    submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
-                if submitted:
-                    if len(new_password) < MIN_PASSWORD_LENGTH:
-                        st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
-                    elif new_password != confirm_password:
-                        st.error("Passwords don't match.")
-                    else:
+        except AccountStorageError:
+            logger.exception("Account store unavailable")
+            st.error("Can't reach the account store right now. Wait a moment, then reload the page.",
+                     icon=":material/cloud_off:")
+            return
+
+        if uid not in users:
+            st.caption(f"No account named **{uid}** yet. Choose a password to create one.")
+            with st.form("signup_form", border=False):
+                new_password = st.text_input("Choose a password", type="password")
+                confirm_password = st.text_input("Confirm password", type="password")
+                submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
+            if submitted:
+                if len(new_password) < MIN_PASSWORD_LENGTH:
+                    st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+                elif new_password != confirm_password:
+                    st.error("Passwords don't match.")
+                else:
+                    try:
                         create_account(uid, new_password)
+                    except AccountExists:
+                        st.error("That name was just taken. Try another one.")
+                    except AccountStorageError:
+                        logger.exception("Could not save account")
+                        st.error("Couldn't save your account. Please try again in a moment.")
+                    else:
                         st.session_state.authenticated_user = uid
                         st.rerun()
-            else:
-                with st.form("login_form"):
-                    password = st.text_input("Password", type="password")
-                    submitted = st.form_submit_button("Log in", type="primary", use_container_width=True)
-                if submitted:
-                    if verify_password(uid, password):
+        else:
+            with st.form("login_form", border=False):
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Log in", type="primary", use_container_width=True)
+            if submitted:
+                try:
+                    ok = verify_password(uid, password)
+                except AccountStorageError:
+                    logger.exception("Account store unavailable")
+                    st.error("Can't reach the account store right now. Please try again in a moment.")
+                else:
+                    if ok:
                         st.session_state.authenticated_user = uid
                         st.rerun()
                     else:
@@ -1600,20 +1612,17 @@ def get_upload_limit_mb():
         return 200
 
 
-def render_uploader(label_visibility="collapsed"):
+def render_uploader():
     return st.file_uploader(
-        "Upload documents",
-        type=ACCEPTED_TYPES,
-        accept_multiple_files=True,
-        key=f"uploader_{st.session_state.uploader_version}",
-        label_visibility=label_visibility,
-        help=f"PDF, Word (.docx), text, or images (JPG, PNG, WEBP, BMP). Up to {get_upload_limit_mb()} MB per file.",
+        "Upload documents", type=ACCEPTED_TYPES, accept_multiple_files=True,
+        key=f"uploader_{st.session_state.uploader_version}", label_visibility="collapsed",
+        help=f"PDF, Word (.docx), text, or images. Up to {get_upload_limit_mb()} MB per file. "
+             "Scanned pages and images are read with Gemini vision, which takes longer.",
     ) or []
 
 
 def split_incoming(files, doc_files):
-    """Separate files that need indexing from ones already indexed (so the same
-    file is never embedded twice)."""
+    """Separate files that need indexing from ones already indexed (so a file is never embedded twice)."""
     to_process, already, seen = [], [], set()
     for f in files:
         if f.name in seen:
@@ -1624,14 +1633,12 @@ def split_incoming(files, doc_files):
 
 
 def process_incoming(files, doc_files, user_id):
-    """Index new files with the existing pipeline, showing real stages, then
-    rerun. Distinguishes 'uploaded' from 'indexed and ready'."""
+    """Index new files with the existing pipeline, showing real stages, then rerun.
+    A file counts as 'ready' only once its chunks are really stored."""
     ss = st.session_state
     to_process, already = split_incoming(files, doc_files)
-
     for f in already:
-        flash("info", f"{f.name} is already indexed. Remove it first if you want to upload it again.")
-
+        flash("info", f"{f.name} is already added. Remove it first to upload it again.")
     if not to_process:
         ss.uploader_version += 1
         st.rerun()
@@ -1639,20 +1646,11 @@ def process_incoming(files, doc_files, user_id):
     for f in to_process:
         ss.file_errors.pop(f.name, None)
         ss.file_sizes[f.name] = getattr(f, "size", None)
-
     names = [f.name for f in to_process]
-    status = st.status(f"Indexing {len(names)} document{'s' if len(names) != 1 else ''}", expanded=True)
-    with status:
-        st.markdown(
-            "".join(
-                f'<div class="rc-doc-chip" style="margin:.15rem .3rem .15rem 0">'
-                f'<span class="rc-pill rc-pill-new">{icon_svg("upload", 12)}Uploaded</span>'
-                f'<span>{esc(n)}</span></div>' for n in names
-            ),
-            unsafe_allow_html=True,
-        )
-        bar = st.progress(0.0, text="Preparing...")
 
+    status = st.status(f"Indexing {', '.join(names)}" if len(names) < 3 else f"Indexing {len(names)} documents", expanded=True)
+    with status:
+        bar = st.progress(0.0, text="Preparing...")
     progress = {"frac": 0.0}
 
     def on_progress(current, total, status_text=None, **kwargs):
@@ -1660,14 +1658,13 @@ def process_incoming(files, doc_files, user_id):
         ratio = (current / total) if total else 0.0
         frac, label = progress["frac"], None
         if text:
-            low = text.lower()
-            label = text
+            low, label = text.lower(), text
             if low.startswith("saving"):
-                frac, label = 0.02, "Saving uploaded files..."
+                frac = 0.02
             elif low.startswith("reading"):
                 frac = 0.05 + 0.30 * ratio
             elif low.startswith("splitting"):
-                frac, label = 0.38, "Splitting text into chunks..."
+                frac = 0.38
             elif low.startswith("embedding"):
                 frac = 0.40 + 0.58 * ratio
         elif total == 0:
@@ -1686,16 +1683,14 @@ def process_incoming(files, doc_files, user_id):
         logger.exception("Document indexing failed")
         message = friendly_file_error(exc)
         for n in names:
-            # remove any chunks stored before the failure so a half-indexed
-            # file never shows up as "ready"
-            try:
+            try:  # remove chunks stored before the failure so a half-indexed file never shows as ready
                 delete_user_document(ss.vectorstore, user_id, n)
             except Exception:
                 pass
             ss.file_errors[n] = message
 
     indexed_now = list_user_documents(ss.vectorstore, user_id)
-    raw_errors = dict(ss.file_errors)  # raw messages recorded by the pipeline
+    raw_errors = dict(ss.file_errors)
     ready, failed = [], []
     for n in names:
         if not failed_hard and n in indexed_now:
@@ -1706,138 +1701,115 @@ def process_incoming(files, doc_files, user_id):
             if not failed_hard:
                 ss.file_errors[n] = friendly_file_error(
                     raw_errors.get(n, "No extractable text found - it may be a scanned/image-only file or empty."))
-    for n in names:
-        ss.ingested_filenames.add(n)
+    ss.ingested_filenames.update(names)
 
     if ready:
-        flash("success", f"{', '.join(ready)} {'is' if len(ready) == 1 else 'are'} indexed and ready for questions.")
+        flash("success", f"{', '.join(ready)} {'is' if len(ready) == 1 else 'are'} ready for questions.")
     if failed:
-        flash("error", f"Couldn't index: {', '.join(failed)}. See the document list for details.")
+        flash("error", f"Couldn't read {', '.join(failed)}. See the document list for details.")
 
-    status.update(label="Indexing finished" if ready else "Indexing failed",
-                  state="complete" if ready else "error", expanded=False)
-    ss.uploader_version += 1  # clear the dropzone so finished files aren't shown twice
+    status.update(label="Done" if ready else "Couldn't index", state="complete" if ready else "error", expanded=False)
+    ss.uploader_version += 1  # clear the upload box so finished files aren't listed twice
     st.rerun()
 
 
-def render_document_cards(doc_files, user_id, processing_names=()):
+def render_documents(doc_files, user_id, processing_names=()):
     ss = st.session_state
-    for name in processing_names:
-        st.markdown(file_card_html(name, "busy", size=ss.file_sizes.get(name)), unsafe_allow_html=True)
-
-    for name, chunk_count in doc_files.items():
-        size = ss.file_sizes.get(name)
-        if not size:
-            path = os.path.join(DOCS_PATH, user_id, name)
-            size = os.path.getsize(path) if os.path.exists(path) else None
-        card_col, action_col = st.columns([5, 1.1], vertical_alignment="center")
-        card_col.markdown(file_card_html(name, "ready", chunks=chunk_count, size=size), unsafe_allow_html=True)
-        if action_col.button(":material/delete:", key=f"rm_{name}", help=f"Remove {name}"):
-            confirm_dialog(f"Remove **{name}** and its {chunk_count} indexed chunks? "
-                           "Chats stay, but answers can no longer use this file.",
-                           "Remove", do_delete_document, (name,))
-
-    for name, message in list(ss.file_errors.items()):
-        if name in doc_files or name in processing_names:
-            continue
-        card_col, action_col = st.columns([5, 1.1], vertical_alignment="center")
-        card_col.markdown(file_card_html(name, "fail", detail=message, size=ss.file_sizes.get(name)),
-                          unsafe_allow_html=True)
-        action_col.button(":material/close:", key=f"dismiss_{name}", help="Dismiss. Upload the file again to retry.",
-                          on_click=cb_dismiss_error, args=(name,))
+    with st.container(key="doc_rows"):
+        for name in processing_names:
+            st.markdown(doc_row_html(name, busy=True), unsafe_allow_html=True)
+        for name, chunk_count in doc_files.items():
+            size = ss.file_sizes.get(name)
+            if not size:
+                path = os.path.join(DOCS_PATH, user_id, name)
+                size = os.path.getsize(path) if os.path.exists(path) else None
+            tip = " | ".join(x for x in (name, human_size(size), f"{chunk_count} chunks") if x)
+            left, right = st.columns([6, 1], vertical_alignment="center", gap="small")
+            left.markdown(doc_row_html(name, tip), unsafe_allow_html=True)
+            if right.button(":material/close:", key=f"rm_{name}", type="tertiary", help=f"Remove {name}"):
+                confirm_dialog(f"Remove **{name}**? Your chats stay, but answers can no longer use this file.",
+                               "Remove", do_delete_document, (name,))
+        for name, message in list(ss.file_errors.items()):
+            if name in doc_files or name in processing_names:
+                continue
+            left, right = st.columns([6, 1], vertical_alignment="center", gap="small")
+            left.markdown(doc_row_html(name) + f'<div class="rc-doc-err">{esc(message)}</div>', unsafe_allow_html=True)
+            right.button(":material/close:", key=f"dismiss_{name}", type="tertiary",
+                         help="Dismiss. Upload the file again to retry.", on_click=cb_dismiss_error, args=(name,))
 
 
 # =====================================================================
 # Sidebar
 # =====================================================================
-def settings_rows(total_chunks):
-    rows = [("Answer model", CHAT_MODEL_NAME),
-            ("Embedding model", EMBEDDING_MODEL_NAME.replace("models/", ""))]
+def settings_lines(total_chunks):
     k_per_query, final_k = retrieval_settings(total_chunks)
     override = st.session_state.context_chunks
-    rows.append(("Retrieval", "Multi-query search + keyword (BM25) re-rank"))
-    rows.append(("Passages sent to model", f"{override if override != 'Auto' else final_k}"
-                                           f"{' (auto)' if override == 'Auto' else ' (your setting)'}"))
-    rows.append(("Chunks checked per search", str(k_per_query)))
+    lines = [f"Answer model: **{CHAT_MODEL_NAME}**",
+             f"Embedding model: **{EMBEDDING_MODEL_NAME.replace('models/', '')}**",
+             f"Passages sent to the model: **{override if override != 'Auto' else final_k}**"
+             f"{' (auto)' if override == 'Auto' else ''}",
+             f"Chunks checked per search: **{k_per_query}**"]
     try:
         params = inspect.signature(ingestion.split_documents).parameters
-        rows.append(("Chunking", f"Heading-aware, up to {params['chunk_size'].default:,} characters, "
-                                 f"{params['chunk_overlap'].default} overlap"))
+        lines.append(f"Chunk size: **{params['chunk_size'].default:,}** characters, **{params['chunk_overlap'].default}** overlap")
     except Exception:
         pass
-    rows.append(("Scanned pages and images", "Read with Gemini vision"))
-    return rows
+    return lines
 
 
 def render_sidebar(user_id, doc_files, total_chunks, uploader_here):
     ss = st.session_state
     incoming = []
     with st.sidebar:
-        st.markdown(brand_html(), unsafe_allow_html=True)
-        st.button("New chat", icon=":material/add:", type="primary", use_container_width=True,
-                  key="new_chat", on_click=cb_new_chat, disabled=ss.generating,
-                  help="Start a fresh conversation")
+        st.markdown(f'<div class="rc-brand">{logo_svg()}<span>{APP_NAME}</span></div>', unsafe_allow_html=True)
+        st.button("New chat", icon=":material/add:", type="primary", use_container_width=True, key="new_chat",
+                  on_click=cb_new_chat, disabled=ss.generating)
 
-        # ---- chats ----
-        st.markdown(section_html("Chats"), unsafe_allow_html=True)
-        order = ss.conv_order
-        list_opts = {"key": "chat_list", "border": False}
-        if len(order) > 6:
-            list_opts["height"] = 260  # scroll box only when the list is long
-        with st.container(**list_opts):
-            for cid in order:
-                conv = ss.conversations[cid]
-                is_active = cid == ss.active_conv
-                with st.container(key="conv_active" if is_active else f"conv_{cid}"):
-                    st.button(conv["title"], key=f"sel_{cid}", use_container_width=True, type="tertiary",
-                              icon=":material/chat_bubble:" if is_active else ":material/chat_bubble_outline:",
-                              on_click=cb_select_chat, args=(cid,), disabled=ss.generating and not is_active)
-        st.markdown('<div class="rc-note">Chats are kept for this browser session only. They are not saved '
-                    'after you refresh or close the page.</div>', unsafe_allow_html=True)
+        chats = [cid for cid in ss.conv_order if ss.conversations[cid]["messages"]]
+        if chats:
+            st.markdown('<div class="rc-label" title="Chats are kept for this browser session only">Chats</div>',
+                        unsafe_allow_html=True)
+            list_opts = {"key": "chat_list", "border": False}
+            if len(chats) > 7:
+                list_opts["height"] = 280  # scroll box only when the list is long
+            with st.container(**list_opts):
+                for cid in chats:
+                    is_active = cid == ss.active_conv
+                    with st.container(key="conv_active" if is_active else f"conv_{cid}"):
+                        st.button(ss.conversations[cid]["title"], key=f"sel_{cid}", use_container_width=True, type="tertiary",
+                                  on_click=cb_select_chat, args=(cid,), disabled=ss.generating and not is_active)
+            st.markdown('<div class="rc-hint">Chats are not saved after you refresh the page.</div>', unsafe_allow_html=True)
 
-        # ---- documents ----
-        st.markdown(section_html("Documents"), unsafe_allow_html=True)
-        if doc_files:
-            st.markdown(f'<div class="rc-summary">{len(doc_files)} document{"s" if len(doc_files) != 1 else ""} '
-                        f'indexed · {total_chunks} chunks searchable</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="rc-summary">No documents indexed yet.</div>', unsafe_allow_html=True)
-
+        st.markdown('<div class="rc-label">Documents</div>', unsafe_allow_html=True)
         processing = []
         if uploader_here:
-            incoming = render_uploader()
-            st.markdown('<div class="rc-note">Scanned pages and images are read with Gemini vision, which takes '
-                        'longer than plain text.</div>', unsafe_allow_html=True)
+            with st.expander("Add documents", icon=":material/upload_file:", expanded=not doc_files):
+                incoming = render_uploader()
             to_process, _ = split_incoming(incoming, doc_files)
             processing = [f.name for f in to_process]
             for f in to_process:
                 ss.file_sizes[f.name] = getattr(f, "size", None)
 
-        render_document_cards(doc_files, user_id, processing_names=processing)
+        render_documents(doc_files, user_id, processing_names=processing)
+        if not doc_files and not ss.file_errors and not processing:
+            st.markdown('<div class="rc-hint">No documents yet.</div>', unsafe_allow_html=True)
+        if len(doc_files) > 1:
+            if st.button("Remove all", icon=":material/delete:", key="rm_all", type="tertiary"):
+                confirm_dialog("Remove **all** of your documents? This can't be undone.", "Remove all", do_clear_documents)
 
-        if doc_files and st.button("Remove all documents", icon=":material/delete_forever:", key="rm_all",
-                                   use_container_width=True):
-            confirm_dialog("Remove **all** of your documents and their indexed chunks? This can't be undone.",
-                           "Remove all", do_clear_documents)
-
-        # ---- settings ----
-        with st.expander("Settings & model info", icon=":material/tune:"):
+        with st.expander("Settings", icon=":material/tune:"):
             st.selectbox(
                 "Passages sent to the model", CONTEXT_CHUNK_CHOICES, key="context_chunks",
-                help="How many of the best-matching passages are given to the model when answering. "
-                     "Auto scales with the size of your collection. More passages can help with broad "
-                     "questions but make answers slower.",
-            )
-            rows = "".join(f'<tr><td style="opacity:.6;padding:.18rem .6rem .18rem 0;vertical-align:top;'
-                           f'font-size:.76rem">{esc(k)}</td><td style="font-size:.76rem">{esc(v)}</td></tr>'
-                           for k, v in settings_rows(total_chunks))
-            st.markdown(f'<div class="rc-note"><table>{rows}</table></div>', unsafe_allow_html=True)
+                help="How many of the best-matching passages the model reads when answering. Auto scales with the "
+                     "size of your collection. More passages can help with broad questions but make answers slower.")
+            st.caption("\n\n".join(settings_lines(total_chunks)))
 
-        # ---- account ----
-        st.markdown(section_html("Account"), unsafe_allow_html=True)
-        st.markdown(f'<div class="rc-summary">Signed in as <b>{esc(user_id)}</b></div>', unsafe_allow_html=True)
-        st.button("Log out", icon=":material/logout:", key="logout", use_container_width=True, on_click=cb_logout,
-                  disabled=ss.generating)
+        st.divider()
+        with st.container(key="account_row"):
+            left, right = st.columns([3, 2], vertical_alignment="center", gap="small")
+            left.caption(f"Signed in as **{user_id}**")
+            right.button("Log out", icon=":material/logout:", key="logout", type="tertiary", on_click=cb_logout,
+                         disabled=ss.generating)
     return incoming
 
 
@@ -1856,97 +1828,108 @@ def docx_for_chat(conv, user_id):
     return data
 
 
-def render_chat_header(conv, user_id, doc_count):
-    left, right = st.columns([8, 1], vertical_alignment="center")
-    left.markdown(
-        f'<div class="rc-chat-title">{esc(conv["title"])}</div>'
-        f'<div class="rc-chat-sub">{doc_count} document{"s" if doc_count != 1 else ""} available · '
-        'session chat</div>', unsafe_allow_html=True)
-    with right.popover(":material/more_horiz:", help="Chat options"):
-        has_messages = bool(conv["messages"])
-        st.download_button(
-            "Download as Word", icon=":material/download:", use_container_width=True, disabled=not has_messages,
-            data=docx_for_chat(conv, user_id) if has_messages else b"",
+def render_chat_header(conv, user_id):
+    with st.container(key="chat_header"):
+        title_col, dl_col, menu_col = st.columns([6, 2.6, 0.9], vertical_alignment="center", gap="small")
+        title_col.markdown(f'<div class="rc-title">{esc(conv["title"])}</div>', unsafe_allow_html=True)
+        dl_col.download_button(
+            "Download chat", icon=":material/download:", use_container_width=True,
+            data=docx_for_chat(conv, user_id),
             file_name=f"chat_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            key=f"dl_{conv['id']}",
+            key=f"dl_{conv['id']}", help="Save this conversation as a Word file",
         )
-        if st.button("Clear messages", icon=":material/delete_sweep:", use_container_width=True,
-                     key=f"clear_{conv['id']}", disabled=st.session_state.generating):
-            confirm_dialog("Clear all messages in this chat?", "Clear", do_clear_chat, (conv["id"],))
-        if st.button("Delete chat", icon=":material/delete:", use_container_width=True, key=f"del_{conv['id']}",
-                     disabled=st.session_state.generating):
-            confirm_dialog("Delete this chat?", "Delete", do_delete_chat, (conv["id"],))
+        with menu_col.popover(":material/more_horiz:", help="More options"):
+            if st.button("Clear messages", icon=":material/delete_sweep:", use_container_width=True,
+                         key=f"clear_{conv['id']}", disabled=st.session_state.generating):
+                confirm_dialog("Clear all messages in this chat?", "Clear", do_clear_chat, (conv["id"],))
+            if st.button("Delete chat", icon=":material/delete:", use_container_width=True, key=f"del_{conv['id']}",
+                         disabled=st.session_state.generating):
+                confirm_dialog("Delete this chat?", "Delete", do_delete_chat, (conv["id"],))
 
 
 def render_sources(msg):
     sources = msg.get("sources") or []
     if not sources:
         return
-    files = {s["name"] for s in sources}
-    label = f"Sources · {len(sources)} passage{'s' if len(sources) != 1 else ''} from " \
-            f"{len(files)} document{'s' if len(files) != 1 else ''}"
-    with st.expander(label, icon=":material/menu_book:"):
-        st.markdown(
-            '<div class="rc-evidence-note">These are the passages retrieved from your documents that the '
-            'answer was based on, shown as stored. The answer above is written by the AI from them. '
-            'Check the passages when accuracy matters.</div>', unsafe_allow_html=True)
-        understood = msg.get("understood_as")
-        if understood:
-            st.markdown(f'<div class="rc-evidence-note">Your question was understood as: '
-                        f'<i>{esc(understood)}</i></div>', unsafe_allow_html=True)
-        box_opts = {"border": False}
-        if len(sources) > 3:
-            box_opts["height"] = 460  # scroll box only when there are many passages
-        with st.container(**box_opts):
+    with st.expander(f"Sources ({len(sources)})", icon=":material/menu_book:"):
+        st.caption("Passages from your documents that this answer is based on.")
+        if msg.get("understood_as"):
+            st.caption(f"Your question was understood as: *{msg['understood_as']}*")
+        box = {"border": False}
+        if len(sources) > 4:
+            box["height"] = 420
+        with st.container(**box):
             for i, src in enumerate(sources, 1):
-                st.markdown(source_card_html(i, src), unsafe_allow_html=True)
+                st.markdown(source_html(i, src), unsafe_allow_html=True)
+
+
+def html_frame(html, height):
+    """Tiny HTML iframe. Uses st.iframe on newer Streamlit, components.html on older versions."""
+    if hasattr(st, "iframe"):
+        try:
+            st.iframe(html, height=max(height, 1))
+            return
+        except Exception:
+            pass
+    components.html(html, height=height)
+
+
+def copy_button(text):
+    """One-click copy. Runs in a tiny iframe so it can use the browser clipboard."""
+    payload = json.dumps(text).replace("<", "\\u003c")
+    html_frame(
+        """<style>body{margin:0}button{display:inline-flex;align-items:center;gap:.4rem;border:0;background:transparent;
+        font:inherit;font-size:14px;cursor:pointer;padding:6px 8px;border-radius:8px;opacity:.75}
+        button:hover{opacity:1;background:rgba(127,127,127,.14)}svg{width:15px;height:15px}</style>
+        <button id="b" title="Copy this answer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span id="l">Copy</span></button>
+        <script>const text=""" + payload + """;const b=document.getElementById('b'),l=document.getElementById('l');
+        try{const cs=window.parent.getComputedStyle(window.parent.document.body);document.body.style.color=cs.color;
+        document.body.style.fontFamily=cs.fontFamily;}catch(e){}
+        b.onclick=async()=>{try{await navigator.clipboard.writeText(text);}catch(e){const t=document.createElement('textarea');
+        t.value=text;document.body.appendChild(t);t.select();try{document.execCommand('copy');}catch(_){}t.remove();}
+        l.textContent='Copied';setTimeout(()=>{l.textContent='Copy'},1500);};</script>""",
+        38,
+    )
 
 
 def render_message(conv, idx, msg, is_last):
     ss = st.session_state
     role = msg["role"]
     with st.chat_message(role, avatar=AVATARS[role]):
-        st.markdown(f'<div class="rc-role">{"You" if role == "user" else APP_NAME}</div>', unsafe_allow_html=True)
         if msg.get("error"):
             st.markdown(error_card_html(msg["content"], msg.get("hint", "")), unsafe_allow_html=True)
         else:
             st.markdown(msg["content"])
-
         if role != "assistant":
             return
-        if msg.get("time") and not msg.get("error"):
-            st.markdown(f'<div class="rc-meta">{esc(msg["time"])}</div>', unsafe_allow_html=True)
         render_sources(msg)
-
-        is_answer = msg.get("kind") not in ("smalltalk", "notice")
-        if not is_answer:
+        if msg.get("kind") in ("smalltalk", "notice"):
             return
-        copy_col, retry_col, _ = st.columns([1.2, 1.5, 4], gap="small", vertical_alignment="center")
-        if not msg.get("error"):
-            with copy_col.popover("Copy", icon=":material/content_copy:", help="Copy this response"):
-                st.caption("Use the copy icon at the top-right of the box.")
-                try:
-                    st.code(msg["content"], language=None, wrap_lines=True)
-                except TypeError:
-                    st.code(msg["content"], language=None)
-        if is_last:
-            retry_col.button("Try again" if msg.get("error") else "Regenerate",
-                             icon=":material/refresh:", key=f"regen_{conv['id']}_{idx}", on_click=cb_regenerate,
-                             disabled=ss.generating, help="Ask the same question again")
+        with st.container(key="msg_actions" if is_last else f"msg_actions_{idx}"):
+            copy_col, retry_col, _ = st.columns([1.3, 2, 6], vertical_alignment="center", gap="small")
+            if not msg.get("error"):
+                with copy_col:
+                    copy_button(msg["content"])
+            if is_last:
+                retry_col.button("Try again" if msg.get("error") else "Regenerate", icon=":material/refresh:",
+                                 key=f"regen_{conv['id']}_{idx}", type="tertiary", on_click=cb_regenerate,
+                                 disabled=ss.generating, help="Ask the same question again")
 
 
 def scroll_to_latest():
-    components.html(
+    html_frame(
         "<script>try{const d=window.parent.document;const m=d.querySelectorAll('[data-testid=\"stChatMessage\"]');"
         "if(m.length){m[m.length-1].scrollIntoView({behavior:'smooth',block:'start'});}}catch(e){}</script>",
-        height=0,
+        1,
     )
 
 
 def run_generation(user_id):
-    """Answer the queued question using the existing RAG pipeline, with live
-    stage updates, friendly errors, and the real sources saved on the message."""
+    """Answer the queued question with the existing RAG pipeline, with live stage updates,
+    friendly errors, and the real sources saved on the message."""
     ss = st.session_state
     pending = ss.pending
     conv = ss.conversations.get(pending["conv"]) if pending else None
@@ -1956,11 +1939,10 @@ def run_generation(user_id):
 
     query = pending["query"]
     history = [{"role": m["role"], "content": m["content"]} for m in conv["messages"][:-1]
-               if not m.get("error") and m.get("kind") not in ("notice",)]
+               if not m.get("error") and m.get("kind") != "notice"]
     override = ss.context_chunks if ss.context_chunks != "Auto" else None
 
     with st.chat_message("assistant", avatar=AVATARS["assistant"]):
-        st.markdown(f'<div class="rc-role">{APP_NAME}</div>', unsafe_allow_html=True)
         slot = st.empty()
         slot.markdown(typing_html("Understanding your question..."), unsafe_allow_html=True)
         scroll_to_latest()
@@ -1970,16 +1952,13 @@ def run_generation(user_id):
 
         try:
             answer, relevant_docs, standalone_query = answer_question(
-                ss.vectorstore, query, user_id, chat_history=history,
-                final_k_override=override, on_stage=on_stage,
-            )
+                ss.vectorstore, query, user_id, chat_history=history, final_k_override=override, on_stage=on_stage)
             understood = standalone_query if standalone_query.strip().lower() != query.strip().lower() else None
-            message = {"role": "assistant", "content": answer, "time": now_label(), "understood_as": understood,
+            message = {"role": "assistant", "content": answer, "understood_as": understood,
                        "sources": [doc_to_source(d) for d in relevant_docs]}
         except Exception as exc:
             title, hint = friendly_error(exc)
-            message = {"role": "assistant", "content": title, "hint": hint, "error": True,
-                       "time": now_label(), "kind": "error"}
+            message = {"role": "assistant", "content": title, "hint": hint, "error": True, "kind": "error"}
         finally:
             ss.generating, ss.pending = False, None
 
@@ -1990,36 +1969,21 @@ def run_generation(user_id):
 
 def render_landing(doc_files, user_id, uploader_in_main):
     has_docs = bool(doc_files)
-    st.markdown(
-        f'<div class="rc-hero"><div class="rc-hero-logo">{logo_svg(54)}</div>'
-        '<div class="rc-hero-title" role="heading" aria-level="1">Chat with your documents</div>'
-        '<div class="rc-hero-sub">Upload PDFs, Word files, text files or images, then ask questions about '
-        'their content. Answers come only from your documents, and the sources are shown.</div></div>',
-        unsafe_allow_html=True)
+    sub = ("Ask a question about your documents. Each answer shows the passages it is based on." if has_docs
+           else "Upload a PDF, Word file, text file or image, then ask questions about what's in it.")
+    st.markdown(f'<div class="rc-hero">{logo_svg()}<h1>Chat with your documents</h1><p>{esc(sub)}</p></div>',
+                unsafe_allow_html=True)
 
     if uploader_in_main:
-        with st.container(border=True):
-            st.markdown('<div class="rc-label" style="margin-top:.2rem">Add your first document</div>',
-                        unsafe_allow_html=True)
-            files = render_uploader()
-            st.markdown('<div class="rc-note" style="text-align:center">Scanned pages and images are read with '
-                        'Gemini vision, which takes a little longer.</div>', unsafe_allow_html=True)
+        files = render_uploader()
         if files:
             process_incoming(files, doc_files, user_id)
-    elif has_docs:
-        names = list(doc_files)[:6]
-        chips = "".join(f'<span class="rc-doc-chip">{icon_svg("image" if file_ext(n) in IMAGE_TYPES else "file", 13)}'
-                        f'<span>{esc(n)}</span></span>' for n in names)
-        more = f'<span class="rc-doc-chip"><span>+{len(doc_files) - 6} more</span></span>' if len(doc_files) > 6 else ""
-        st.markdown(f'<div class="rc-chips">{chips}{more}</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="rc-label">Try asking</div>', unsafe_allow_html=True)
-    with st.container(key="suggestions"):
-        cols = st.columns(2)
-        for i, (icon, text) in enumerate(SUGGESTED_PROMPTS):
-            cols[i % 2].button(text, icon=icon, key=f"suggest_{i}", use_container_width=True,
-                               on_click=cb_use_prompt, args=(text,), disabled=not has_docs,
-                               help=None if has_docs else "Add a document first")
+    if has_docs:
+        with st.container(key="suggestions"):
+            cols = st.columns(2)
+            for i, (icon, text) in enumerate(SUGGESTED_PROMPTS):
+                cols[i % 2].button(text, icon=icon, key=f"suggest_{i}", use_container_width=True,
+                                   on_click=cb_use_prompt, args=(text,))
 
 
 # =====================================================================
@@ -2032,8 +1996,7 @@ if "vectorstore" not in ss:
     ss.vectorstore = load_existing_vectorstore()
 for _key, _default in (
     ("ingested_filenames", set()), ("uploader_version", 0), ("file_errors", {}), ("file_sizes", {}),
-    ("flash", []), ("generating", False), ("pending", None), ("context_chunks", "Auto"),
-    ("scroll_pending", False),
+    ("flash", []), ("generating", False), ("pending", None), ("context_chunks", "Auto"), ("scroll_pending", False),
 ):
     if _key not in ss:
         ss[_key] = _default
@@ -2059,15 +2022,13 @@ uploader_in_main = landing_mode and not doc_files and not ss.file_errors
 
 sidebar_files = render_sidebar(user_id, doc_files, total_chunks, uploader_here=not uploader_in_main)
 
-# one-time messages from the previous run (toasts for success, banners for problems)
+# one-time messages from the previous run
 notices, ss.flash = ss.flash, []
 for kind, text in notices:
     if kind == "success":
         st.toast(text, icon=":material/check_circle:")
     elif kind == "info":
         st.toast(text, icon=":material/info:")
-    elif kind == "warning":
-        st.warning(text, icon=":material/warning:")
     else:
         st.error(text, icon=":material/error:")
 
@@ -2077,16 +2038,12 @@ if sidebar_files:
 if landing_mode:
     render_landing(doc_files, user_id, uploader_in_main)
 else:
-    render_chat_header(conv, user_id, len(doc_files))
+    render_chat_header(conv, user_id)
     for i, message in enumerate(conv["messages"]):
         render_message(conv, i, message, is_last=(i == len(conv["messages"]) - 1))
 
 # ---- composer (docked to the bottom by Streamlit) ----
-composer = {
-    "placeholder": "Ask anything about your documents...",
-    "key": "composer",
-    "disabled": ss.generating,
-}
+composer = {"placeholder": "Ask anything about your documents...", "key": "composer", "disabled": ss.generating}
 if "accept_file" in inspect.signature(st.chat_input).parameters:
     composer.update(accept_file="multiple", file_type=ACCEPTED_TYPES)  # attachment button
 submitted = st.chat_input(**composer)
@@ -2107,8 +2064,7 @@ if submitted:
 
 # a question typed together with an attachment is asked once the files are indexed
 if ss.get("deferred_question") and not ss.generating:
-    deferred = ss.pop("deferred_question")
-    queue_question(deferred)
+    queue_question(ss.pop("deferred_question"))
     st.rerun()
 
 if ss.generating and ss.pending:
